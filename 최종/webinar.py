@@ -7,7 +7,7 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
-import openai
+from openai import OpenAI
 import tempfile
 import streamlit as st
 from streamlit_chat import message
@@ -33,7 +33,7 @@ class WebinarSummarizer:
         if not openai_api_key:
             raise ValueError("OpenAI API 키가 필요합니다.")
         self.openai_api_key = openai_api_key
-        openai.api_key = openai_api_key
+        self.client = OpenAI(api_key=openai_api_key)
 
         # 모델 초기화
         self.embeddings = OpenAIEmbeddings(
@@ -62,8 +62,7 @@ class WebinarSummarizer:
         try:
             # 비디오 파일을 직접 Whisper API로 전송
             with open(video_path, "rb") as video:
-                client = openai.OpenAI(api_key=self.openai_api_key)
-                transcript = client.audio.transcriptions.create(
+                transcript = self.client.audio.transcriptions.create(
                     model="whisper-1",
                     file=video,
                     language="ko"
@@ -76,8 +75,7 @@ class WebinarSummarizer:
         """오디오 파일을 텍스트로 변환합니다 (OpenAI Whisper API 사용)."""
         try:
             with open(audio_path, "rb") as audio_file:
-                client = openai.OpenAI(api_key=self.openai_api_key)
-                transcript = client.audio.transcriptions.create(
+                transcript = self.client.audio.transcriptions.create(
                     model="whisper-1",
                     file=audio_file,
                     language="ko"
@@ -101,8 +99,8 @@ class WebinarSummarizer:
         """YouTube 영상에서 오디오를 추출하고 STT로 변환합니다."""
         ydl_opts = {
             'format': 'bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
+            'quiet': False,
+            'no_warnings': False,
             'outtmpl': '%(id)s.%(ext)s',
             'writesubtitles': False,
             'writeautomaticsub': False,
@@ -111,21 +109,79 @@ class WebinarSummarizer:
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
-            }]
+            }],
+            'nocheckcertificate': True,
+            'ignoreerrors': True,
+            'no_color': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web', 'mweb', 'tv_embedded'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+            'cookiesfrombrowser': None,  # 쿠키 로딩 비활성화
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'referer': 'https://www.youtube.com/',
+            'socket_timeout': 30,
+            'retries': 10,
+            'extract_flat': False,
+            'force_generic_extractor': False,
+            'geo_bypass': True,
+            'geo_verification_proxy': None,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-us,en;q=0.5',
+                'Sec-Fetch-Mode': 'navigate',
+            }
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            audio_file = None
             try:
+                # URL 유효성 검사
+                if not url.startswith(('http://', 'https://')):
+                    raise Exception("올바른 URL 형식이 아닙니다.")
+                
+                # URL에서 비디오 ID 추출 시도
+                video_id = None
+                if 'youtube.com/watch?v=' in url:
+                    video_id = url.split('watch?v=')[1].split('&')[0]
+                elif 'youtu.be/' in url:
+                    video_id = url.split('youtu.be/')[1].split('?')[0]
+                
+                if video_id:
+                    print(f"추출된 비디오 ID: {video_id}")
+                    audio_file = f"{video_id}.mp3"
+                
                 # 오디오 다운로드
-                info = ydl.extract_info(url, download=True)
-                video_id = info['id']
-                audio_file = f"{video_id}.mp3"
+                print(f"비디오 정보 추출 시도: {url}")
+                try:
+                    info = ydl.extract_info(url, download=True)
+                except Exception as e:
+                    print(f"첫 번째 시도 실패: {str(e)}")
+                    # 두 번째 시도: 다른 형식으로
+                    ydl_opts['format'] = 'bestaudio'
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                        info = ydl2.extract_info(url, download=True)
+                
+                print(f"추출된 정보: {info}")
+                
+                if info is None:
+                    raise Exception("비디오 정보를 가져올 수 없습니다.")
+                
+                if not video_id:
+                    video_id = info.get('id')
+                    if not video_id:
+                        raise Exception("비디오 ID를 찾을 수 없습니다.")
+                    audio_file = f"{video_id}.mp3"
+                
+                print(f"오디오 파일 경로: {audio_file}")
                 
                 if os.path.exists(audio_file):
                     # Whisper API로 STT 변환
                     with open(audio_file, "rb") as audio:
-                        client = openai.OpenAI(api_key=self.openai_api_key)
-                        transcript = client.audio.transcriptions.create(
+                        transcript = self.client.audio.transcriptions.create(
                             model="whisper-1",
                             file=audio,
                             language="ko"
@@ -135,13 +191,14 @@ class WebinarSummarizer:
                 else:
                     raise Exception(f"오디오 파일을 찾을 수 없습니다. (예상 경로: {audio_file})")
             except Exception as e:
+                if audio_file and os.path.exists(audio_file):
+                    os.remove(audio_file)
                 raise Exception(f"오디오 처리 중 오류 발생: {str(e)}")
 
     def create_summary(self, transcript: str) -> str:
         """자막을 요약합니다."""
         try:
-            client = openai.OpenAI(api_key=self.openai_api_key)
-            response = client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model="gpt-4",
                 messages=[
                     {"role": "system", "content": "당신은 웨비나 내용을 요약하는 전문가입니다. 주어진 자막을 바탕으로 주요 내용을 요약해주세요."},
